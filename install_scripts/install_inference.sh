@@ -57,7 +57,22 @@ uv venv .venv_inference --python "$MANAGED_PY" --prompt gear_sonic_inference
 # shellcheck disable=SC1091
 source .venv_inference/bin/activate
 echo "[INFO] Installing gear_sonic[inference] (this may take a few minutes) …"
-uv pip install -e "gear_sonic[inference]"
+# NOTE: --no-sources is required because Isaac-GR00T's pyproject.toml declares
+# `[tool.uv.sources] torchcodec = { path = ".../*.whl" }` for aarch64. uv refuses
+# transitive Git deps that reference a local *file* (only directories are allowed),
+# which causes the install to fail on x86_64 too even though the marker excludes us.
+# --no-sources tells uv to ignore [tool.uv.sources] and resolve from PyPI / default
+# indexes instead. Safe for x86_64 (CUDA torch wheels are on PyPI).
+#
+# Side effect: --no-sources also drops gr00t's prebuilt flash-attn wheel URL, which
+# would force uv to build flash-attn from source. flash-attn's setup.py imports torch
+# but does not declare it as a build dep, so isolated builds fail with
+# "ModuleNotFoundError: No module named 'torch'". Pre-install torch and the matching
+# flash-attn wheel here so resolution finds them already satisfied.
+echo "[INFO] Pre-installing torch==2.7.1 and flash-attn prebuilt wheel (x86_64, cu12, cp310) …"
+uv pip install "torch==2.7.1"
+uv pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
+uv pip install --no-sources -e "gear_sonic[inference]"
 
 echo ""
 echo "══════════════════════════════════════════════════════════════"
