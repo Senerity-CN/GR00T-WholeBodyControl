@@ -5,6 +5,9 @@ import numpy as np
 import pyarrow.parquet as pq
 from pathlib import Path
 
+def fmt_array(arr):
+    return np.array2string(np.asarray(arr), separator=', ', formatter={'float_kind': lambda x: f'{x:8.4f}'})
+
 DATA_DIR = Path("outputs/full_merged_dataset/data/chunk-000")
 COLUMNS = ["action.motion_token", "teleop.left_hand_joints", "teleop.right_hand_joints"]
 
@@ -29,7 +32,7 @@ for col in COLUMNS:
     var = data.var(axis=0)
     print(f"\n{'─' * 80}")
     print(f"【{col}】 shape: {data.shape}")
-    print(f"  均值 (mean): {mean}")
-    print(f"  方差 (var):  {var}")
+    print(f"  均值 (mean): {fmt_array(mean)}")
+    print(f"  方差 (var):  {fmt_array(var)}")
     print(f"  均值范围: [{mean.min():.6f}, {mean.max():.6f}]")
     print(f"  方差范围: [{var.min():.6f}, {var.max():.6f}]")
