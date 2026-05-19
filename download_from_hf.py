@@ -19,6 +19,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+# 设置 Hugging Face 镜像（用于国内访问）
+os.environ["HF_ENDPOINT"] = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
+
 REPO_ID = "nvidia/GEAR-SONIC"
 
 # (filename in HF repo, local destination relative to output_dir)
