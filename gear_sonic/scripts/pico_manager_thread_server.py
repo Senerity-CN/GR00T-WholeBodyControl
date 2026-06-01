@@ -131,6 +131,52 @@ class StreamMode(Enum):
     PLANNER_VR_3PT = 5
 
 
+# ---------------------------------------------------------------------------
+# Wrist-mounted controller correction (--wuji)
+# When controller is strapped to the wrist, use its orientation directly
+# to derive wrist orientation, replacing the body tracking estimate.
+#
+# Pipeline per side:
+#   q_ctrl_raw → * Q_R (inter-session correction) → * Q_CTRL2WRIST → overwrite joints 20-23
+# ---------------------------------------------------------------------------
+# Controller-to-wrist fixed offset (physical mounting property).
+# q_wrist = q_controller * Q_CTRL2WRIST
+# Measured across 6 sessions / 4820 frames, cross-session deviation = 0.00°.
+Q_CTRL2WRIST_LEFT = sRot.from_quat([+0.4333, -0.3503, +0.6667, +0.4949])
+Q_CTRL2WRIST_RIGHT = sRot.from_quat([+0.4231, +0.3791, -0.6810, +0.4621])
+
+# Controller right-multiply correction (local-frame).
+# q_ctrl_corrected = q_ctrl_src * Q_R
+Q_R_LEFT = sRot.from_quat([+0.3733, -0.2406, +0.4889, -0.7508])
+Q_R_RIGHT = sRot.from_quat([+0.4494, +0.1109, -0.5804, -0.6699])
+
+
+def apply_controller_correction(
+    body_poses_np: np.ndarray,
+    left_ctrl_quat: np.ndarray | None,
+    right_ctrl_quat: np.ndarray | None,
+) -> np.ndarray:
+    """Replace SMPL wrist/hand orientations using corrected controller orientations.
+
+    Pipeline per side:
+      1. correct controller:    q_ctrl' = q_ctrl * Q_R
+      2. controller to wrist:   q_wrist = q_ctrl' * Q_CTRL2WRIST
+      3. overwrite joints 20/22 or 21/23
+    """
+    bp = body_poses_np.copy()
+    if left_ctrl_quat is not None:
+        q_ctrl = sRot.from_quat(left_ctrl_quat) * Q_R_LEFT
+        q_wrist = (q_ctrl * Q_CTRL2WRIST_LEFT).as_quat()
+        bp[20, 3:] = q_wrist
+        bp[22, 3:] = q_wrist
+    if right_ctrl_quat is not None:
+        q_ctrl = sRot.from_quat(right_ctrl_quat) * Q_R_RIGHT
+        q_wrist = (q_ctrl * Q_CTRL2WRIST_RIGHT).as_quat()
+        bp[21, 3:] = q_wrist
+        bp[23, 3:] = q_wrist
+    return bp
+
+
 ### Parse 3 point pose from SMPL
 #
 # OFFSETS: Rotation corrections applied to each keypoint to align SMPL joint frames
@@ -744,7 +790,7 @@ class PicoReader:
     Background reader that pulls Pico/XRT data as fast as possible and computes dt/FPS.
     """
 
-    def __init__(self, max_queue_size: int = 15):
+    def __init__(self, max_queue_size: int = 15, wuji: bool = False):
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._last_t = None
@@ -752,6 +798,9 @@ class PicoReader:
         self._last_stamp_ns = None
         self._latest = None
         self._lock = threading.Lock()
+        self._wuji = wuji
+        if wuji:
+            print("[PicoReader] Wrist-mount compensation (wuji) enabled")
 
     def start(self):
         self._thread.start()
@@ -785,9 +834,16 @@ class PicoReader:
             t_monotonic = time.monotonic()
             try:
                 body_poses = xrt.get_body_joints_pose()
+                body_poses_np = np.array(body_poses)
+                if self._wuji:
+                    left_ctrl = np.array(xrt.get_left_controller_pose())
+                    right_ctrl = np.array(xrt.get_right_controller_pose())
+                    body_poses_np = apply_controller_correction(
+                        body_poses_np, left_ctrl[3:], right_ctrl[3:]
+                    )
 
                 sample = {
-                    "body_poses_np": np.array(body_poses),
+                    "body_poses_np": body_poses_np,
                     "timestamp_realtime": t_realtime,
                     "timestamp_monotonic": t_monotonic,
                     "timestamp_ns": stamp_ns,
@@ -820,6 +876,7 @@ def _pose_stream_common(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    wuji: bool = False,
 ):
     """Shared pose streaming loop used by run_pico."""
     if xrt is None:
@@ -828,7 +885,7 @@ def _pose_stream_common(
         )
 
     # Create reader and start it
-    reader = PicoReader(max_queue_size=buffer_size)
+    reader = PicoReader(max_queue_size=buffer_size, wuji=wuji)
     reader.start()
 
     # Create 3-point pose processor with visualization settings
@@ -1504,6 +1561,7 @@ def run_pico(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    wuji: bool = False,
 ):
     """Run Pico body tracking with real-time visualization and ZMQ streaming."""
     if xrt is None:
@@ -1542,6 +1600,7 @@ def run_pico(
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=enable_waist_tracking,
             enable_smpl_vis=enable_smpl_vis,
+            wuji=wuji,
         )
     finally:
         socket.close()
@@ -1814,6 +1873,7 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    wuji: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1847,7 +1907,7 @@ def run_pico_manager(
         pass
 
     # Create shared reader and 3-point pose processor
-    reader = PicoReader(max_queue_size=buffer_size)
+    reader = PicoReader(max_queue_size=buffer_size, wuji=wuji)
     reader.start()
 
     three_point = ThreePointPose(
@@ -2156,6 +2216,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--wuji",
+        action="store_true",
+        help="Apply wrist-mounted controller compensation (for controllers strapped to wrist)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2196,6 +2261,7 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            wuji=args.wuji,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -2211,4 +2277,5 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            wuji=args.wuji,
         )

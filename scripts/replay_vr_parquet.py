@@ -116,51 +116,6 @@ DEFAULT_FPS = 50
 NUM_FRAMES_TO_SEND = 5
 MANAGER_STATE_PERIOD_S = 0.5
 
-# Wrist-mounted controller compensation — GLOBAL rotation deltas.
-# When the Pico controller is strapped to the wrist instead of held in hand,
-# body tracking produces systematically different bone rotations for the entire
-# arm chain (shoulder → elbow → wrist → hand), because the controller acts as
-# an IK anchor and its repositioning causes the SDK to re-solve the whole chain.
-#
-# These deltas are measured in the VR global frame from paired recordings
-# (6 mounted + 6 handheld executions of the same task, pick-and-place).
-# Pairs 1+2 are used (std < 0.5° per-pair, cross-pair agreement < 1°).
-#
-# delta = mean(handheld_global * mounted_global.inv())
-# Applied as: corrected_global = delta * original_global
-#
-# Measured magnitudes (avg across pairs 1+2):
-#   j16 left_shoulder:  22°    j17 right_shoulder: 20°
-#   j18 left_elbow:     59°    j19 right_elbow:    49°
-#   j20 left_wrist:     64°    j21 right_wrist:    76°
-#   j22 left_hand:      64°    j23 right_hand:     76°
-MOUNT_COMPENSATION_GLOBAL = {
-    16: sRot.from_quat([-0.083631, +0.003198, +0.177546, +0.980547]),  # left_shoulder
-    17: sRot.from_quat([-0.081916, +0.011982, -0.160474, +0.983562]),  # right_shoulder
-    18: sRot.from_quat([+0.163124, -0.011533, +0.460858, +0.872277]),  # left_elbow
-    19: sRot.from_quat([+0.281038, +0.080750, -0.290761, +0.911019]),  # right_elbow
-    20: sRot.from_quat([-0.426297, +0.309393, -0.065571, +0.847495]),  # left_wrist
-    21: sRot.from_quat([-0.435883, -0.397595, +0.172727, +0.788726]),  # right_wrist
-    22: sRot.from_quat([-0.426297, +0.309393, -0.065571, +0.847495]),  # left_hand (= wrist)
-    23: sRot.from_quat([-0.435883, -0.397595, +0.172727, +0.788726]),  # right_hand (= wrist)
-}
-
-
-def apply_wrist_mount_compensation(body_poses_np: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Apply wrist-mounted controller compensation to body_poses_np (24, 7).
-
-    Corrects global rotations for the full arm chain (j16-j23) so that
-    compute_from_body_poses produces results equivalent to hand-held data.
-    Each joint is independently corrected in the VR global frame.
-    """
-    bp = body_poses_np.copy()
-
-    for joint_idx, delta in MOUNT_COMPENSATION_GLOBAL.items():
-        orig_rot = sRot.from_quat(bp[joint_idx, 3:])  # xyzw
-        bp[joint_idx, 3:] = (delta * orig_rot).as_quat()  # xyzw
-
-    return bp
-
 # SMPL parent indices for FK
 PARENT_INDICES = [
     -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23,
@@ -615,10 +570,6 @@ def main() -> None:
         help="Pause after bind() for SUBs to connect.",
     )
     parser.add_argument(
-        "--wrist_mount_compensation", action="store_true",
-        help="Apply wrist-mounted controller compensation to vr_3pt_pose.",
-    )
-    parser.add_argument(
         "--correct_controller", action="store_true",
         help="Apply right-multiply correction to controller quats and overwrite "
              "wrist/hand in SMPL (transforms 153640-style to 154545-style).",
@@ -646,9 +597,6 @@ def main() -> None:
     for i, body_poses_np in enumerate(vr_frames):
         if args.correct_controller and controller_quats is not None:
             body_poses_np = apply_controller_correction(body_poses_np, *controller_quats[i])
-
-        if args.wrist_mount_compensation:
-            body_poses_np = apply_wrist_mount_compensation(body_poses_np)
 
         result = compute_from_body_poses(PARENT_INDICES, device, body_poses_np)
 
