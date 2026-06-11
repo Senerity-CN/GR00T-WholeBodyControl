@@ -25,14 +25,14 @@
 | ~~下载 Bones-SEED G1 数据~~ | ✅ 已完成 | g1.tar.gz 23.5GB |
 | ~~转换 Bones-SEED CSV → motion_lib PKL~~ | ✅ 已完成 | 142,220 条 robot PKL |
 | ~~过滤不可执行动作~~ | ✅ 已完成 | 129,785 条 robot_filtered PKL |
-| ~~解压 bones_seed_smpl~~ | ✅ 已完成 | 131,455 条 SMPL PKL |
+| ~~解压 smpl_mixed（原 bones_seed_smpl）~~ | ✅ 已完成 | 131,455 条 SMPL PKL |
 | ~~Kimodo 生成补充动作~~ | ✅ 已完成 | v1 脚本 75 条 + v2 脚本 ~183 条 ≈ 258 条原始动作 |
 | ~~人工筛选~~ | ✅ 已完成 | 逐条检查全部生成动作，保留 144 条质量合格数据 |
 | ~~转换 Kimodo NPZ → SMPL PKL~~ | ✅ 已完成 | 144 条 smpl_finetune PKL |
 | ~~检查 SMPL 数据格式~~ | ✅ 已完成 | 全部通过：pose_aa(T,72), smpl_joints(T,24,3), transl(T,3), fps=50.0 |
 | ~~BVH → SOMA Retargeter → G1 CSV~~ | ✅ 已完成 | 144 条 BVH → Newton IK → 144 个 G1 29-DOF CSV（81s GPU加速） |
 | ~~CSV → Robot motion_lib PKL~~ | ✅ 已完成 | 144 条 robot PKL，0 failures |
-| ~~配置混合数据目录~~ | ✅ 已完成 | motion_lib_mixed（129,785 + 144 = 129,929），SMPL 合入 bones_seed_smpl（131,455 + 144 = 131,599） |
+| ~~配置混合数据目录~~ | ✅ 已完成 | motion_lib_mixed（129,785 + 144 = 129,929），SMPL 合入 smpl_mixed（131,455 + 144 = 131,599） |
 | ~~数据完整性验证~~ | ✅ 已完成 | 144/144 robot-SMPL 文件名对齐确认 |
 | ~~本地 4090 试跑~~ | ✅ 已完成 | Docker 容器内单 GPU 验证通过，训练循环正常运行 |
 | 多 GPU 正式微调 | ⏳ 待做 | 从 release checkpoint 继续（推荐 8+ GPU） |
@@ -43,14 +43,13 @@
 
 ```
 GR00T-WholeBodyControl/data/
-├── motion_lib_finetune/         # Kimodo → SOMA Retargeter → G1 CSV → robot PKL (144 PKLs)
-│   └── outputs_retargeted_csv/  # 实际 PKL 存放子目录
+├── motion_lib_finetune/         # Kimodo → SOMA Retargeter → G1 CSV → robot PKL (144 PKLs，扁平)
 ├── motion_lib_mixed/            # ★ 微调用混合 robot 目录 (129,929 PKLs)
 │   ├── original → /home/balance/GEAR-SONIC/sample_data/robot_filtered  (129,785 PKLs, 按日期子目录)
 │   └── finetune → /home/balance/GR00T-WholeBodyControl/data/motion_lib_finetune  (144 PKLs)
-├── bones_seed_smpl → /home/balance/GEAR-SONIC/smpl_filtered
+├── smpl_mixed → /home/balance/GEAR-SONIC/smpl_filtered
 │                                # 131,455 + 144 = 131,599 PKLs（扁平，无子目录）
-└── smpl_finetune/               # Kimodo NPZ 转换的 SMPL 数据（转换源，已合入 bones_seed_smpl）
+└── smpl_finetune/               # Kimodo NPZ 转换的 SMPL 数据（转换源，已合入 smpl_mixed）
 ```
 
 外部数据位置：
@@ -117,7 +116,7 @@ Kimodo SOMA-RP-v1.1 生成（.npz + .bvh，30fps）
     │
     ├──[NPZ 路径]──→ convert_kimodo_soma_to_smpl_lib.py ──→ SMPL PKL
     │                 SOMA77 关节索引映射 → SMPL24                 ↓
-    │                                                    合入 bones_seed_smpl/
+    │                                                    合入 smpl_mixed/
     │
     └──[BVH 路径]──→ SOMA Retargeter (Newton IK) ──→ G1 29-DOF CSV
                                                            │
@@ -207,7 +206,7 @@ mkdir -p data/motion_lib_mixed
 ln -sf $(realpath data/motion_lib_bones_seed/robot_filtered) data/motion_lib_mixed/original
 ln -sf $(realpath data/motion_lib_finetune) data/motion_lib_mixed/finetune
 
-# SMPL: 直接复制 144 个 finetune PKL 到 bones_seed_smpl 指向的扁平目录
+# SMPL: 直接复制 144 个 finetune PKL 到 smpl_mixed 指向的扁平目录
 cp data/smpl_finetune/*.pkl /home/balance/GEAR-SONIC/smpl_filtered/
 ```
 
@@ -308,7 +307,7 @@ accelerate launch --num_processes=8 gear_sonic/train_agent_trl.py \
 | --- | --- | --- |
 | `checkpoint` | `GEAR-SONIC/sonic_release/last.pt` | 从 release 继续（448MB） |
 | `motion_file` | `data/motion_lib_mixed` | **需要 override**：原始 129,785 + 新增 144 = 129,929 条 |
-| `smpl_motion_file` | `data/bones_seed_smpl`（默认值） | 无需 override：已包含 131,455 + 144 = 131,599 条 |
+| `smpl_motion_file` | `data/smpl_mixed`（默认值） | 无需 override：已包含 131,455 + 144 = 131,599 条 |
 | `num_envs` | 1024（单 GPU）/ 4096（多 GPU） | 单 4090 用 1024 避免 OOM |
 | `max_grad_norm` | 0.1（已是默认） | 微调保持小梯度 |
 | GPU 数量 | 1（本地测试）/ 8+（正式训练） | 文档推荐 64 GPU 才有合理收敛速度 |

@@ -98,7 +98,7 @@ def main(override_config: omegaconf.OmegaConf):
             raw = raw.replace("groot.rl.agents.", "gear_sonic.trl.")
             raw = raw.replace("groot/rl/data/", "gear_sonic/data/")
             raw = raw.replace("assets/bm/unitree_description/", "assets/robot_description/")
-            raw = raw.replace("1215_bones_seed_filtered", "bones_seed_smpl")
+            raw = raw.replace("1215_bones_seed_filtered", "smpl_mixed")
             import io
             train_config = omegaconf.OmegaConf.load(io.StringIO(raw))
 
