@@ -4,12 +4,18 @@
 Kimodo's SOMA-RP model outputs SOMASkeleton77 data as NPZ files.
 SONIC's SMPL encoder expects per-sequence PKL files with:
   - pose_aa:     (T, 72)    SMPL 24-joint axis-angle
-  - smpl_joints: (T, 24, 3) SMPL 24-joint 3D positions
-  - transl:      (T, 3)     root translation
+  - smpl_joints: (T, 24, 3) SMPL 24-joint 3D positions (from compute_human_joints FK)
+  - transl:      (T, 3)     root translation (Y-up convention)
   - fps:         float
 
-This script maps the 77-joint SOMA skeleton to the 24-joint SMPL skeleton,
-bypassing SOMA retargeter to avoid introducing retargeting noise.
+The conversion ensures consistency with:
+  - Bones-SEED official SMPL data convention
+  - Teleop pipeline (pico_manager_thread_server.py:process_smpl_joints)
+
+Key conventions:
+  - pose_aa[:, :3] = R_world (world orientation, NO SMPL base rotation)
+  - smpl_joints generated via compute_human_joints(body[:63], ytoz(root))
+  - transl stays in Y-up (transl[1] = pelvis height)
 
 Usage:
     # Convert a single directory of NPZs
@@ -17,21 +23,28 @@ Usage:
         --input /home/balance/kimodo/outputs/backward_walking \
         --output data/smpl_finetune/backward_walking
 
-    # Convert all three categories
+    # Convert all categories
     python gear_sonic/data_process/convert_kimodo_soma_to_smpl_lib.py \
-        --input /home/balance/kimodo/outputs/backward_walking \
-               /home/balance/kimodo/outputs/small_steps \
-               /home/balance/kimodo/outputs/upper_body_reach \
+        --input /home/balance/kimodo/outputs \
         --output data/smpl_finetune
 """
 
 import argparse
 import os
 import sys
+from typing import Any
 
 import joblib
 import numpy as np
+import torch
 from scipy.spatial.transform import Rotation
+
+from gear_sonic.isaac_utils.rotations import quat_mul
+from gear_sonic.trl.utils.torch_transform import (
+    angle_axis_to_quaternion,
+    compute_human_joints,
+    quaternion_to_angle_axis,
+)
 
 # SOMA SOMASkeleton77 index → SMPL 24-joint index mapping.
 # Derived from matching joint names between the two skeletons.
@@ -65,37 +78,70 @@ SOMA77_TO_SMPL24 = {
 # SOMA77 indices for the 24 SMPL joints, ordered by SMPL joint index
 SOMA77_INDICES = [0, 67, 72, 1, 68, 73, 2, 69, 74, 3, 70, 75, 4, 11, 39, 6, 12, 40, 13, 41, 14, 42, 14, 42]
 
+# NOTE: bones_seed pose_aa[:,:3] does NOT include SMPL base rotation.
+# The base rotation (120° around [1,1,1]) is only introduced by the training
+# code's remove_smpl_base_rot() pipeline. We store raw R_world here.
 
-def convert_npz_to_smpl_pkl(npz_path: str, target_fps: float = 30.0) -> dict:
-    """Convert a single Kimodo SOMA NPZ to SONIC smpl_motion_file format."""
+
+def convert_npz_to_smpl_pkl(npz_path: str, target_fps: float = 30.0) -> dict[str, Any]:
+    """Convert a single Kimodo SOMA NPZ to SONIC smpl_motion_file format.
+
+    Pipeline (matches bones_seed convention and process_smpl_joints):
+      1. pose_aa root = R_world.as_rotvec()  -- world orientation, no base rotation
+      2. smpl_joints = compute_human_joints(body[:63], ytoz(root_aa))  -- Z-up FK
+      3. transl = root_positions  -- Y-up convention (transl[1] = height)
+    """
     data = np.load(npz_path)
 
     local_rot_mats = data["local_rot_mats"]  # (T, 77, 3, 3)
-    posed_joints = data["posed_joints"]      # (T, 77, 3)
+    posed_joints = data["posed_joints"]      # (T, 77, 3)  (unused now, kept for reference)
     root_positions = data["root_positions"]  # (T, 3)
-    T = posed_joints.shape[0]
+    T = local_rot_mats.shape[0]
 
     # Kimodo generates at 30 fps
     source_fps = 30.0
 
-    # 1. Extract smpl_joints (T, 24, 3) from posed_joints (T, 77, 3)
-    smpl_joints = posed_joints[:, SOMA77_INDICES, :]  # (T, 24, 3)
+    # === 1. pose_aa: root = R_world (no base rotation), body as local rotations ===
+    R_world = Rotation.from_matrix(local_rot_mats[:, 0])        # (T,)
+    root_aa = R_world.as_rotvec().astype(np.float32)            # (T, 3)
 
-    # 2. Extract pose_aa (T, 72) from local_rot_mats (T, 77, 3, 3)
-    #    Convert rotation matrices to axis-angle for the 24 SMPL joints
-    rot_mats_24 = local_rot_mats[:, SOMA77_INDICES, :, :]  # (T, 24, 3, 3)
-    rot_mats_flat = rot_mats_24.reshape(-1, 3, 3)  # (T*24, 3, 3)
-    rotvecs = Rotation.from_matrix(rot_mats_flat).as_rotvec().astype(np.float32)
-    pose_aa = rotvecs.reshape(T, 72)  # (T, 24*3)
+    # Body joints (SMPL joints 1-23): extract local rotations from SOMA77
+    body_rot_mats = local_rot_mats[:, SOMA77_INDICES[1:], :, :]  # (T, 23, 3, 3)
+    body_aa = Rotation.from_matrix(
+        body_rot_mats.reshape(-1, 3, 3)
+    ).as_rotvec().astype(np.float32).reshape(T, 69)              # (T, 69)
 
-    # 3. Root translation
-    transl = root_positions.astype(np.float32)  # (T, 3)
+    pose_aa = np.concatenate([root_aa, body_aa], axis=1)         # (T, 72)
 
-    # 4. Resample to target_fps if needed
+    # === 2. smpl_joints: use compute_human_joints (same as teleop/bones_seed) ===
+    # global_orient for FK = ytoz(root_aa) = Rx90 * R_world
+    root_tensor = torch.from_numpy(root_aa).float()
+    root_quat = angle_axis_to_quaternion(root_tensor)            # (T, 4)
+    rx90_quat = angle_axis_to_quaternion(
+        torch.tensor([[np.pi / 2, 0.0, 0.0]])
+    )                                                            # (1, 4)
+    root_quat_z = quat_mul(
+        rx90_quat.expand(T, -1), root_quat, w_last=False
+    )                                                            # (T, 4) Z-up
+    global_orient_z = quaternion_to_angle_axis(root_quat_z)      # (T, 3)
+
+    body_pose_63 = torch.from_numpy(body_aa[:, :63]).float()     # first 21 body joints
+    with torch.no_grad():
+        smpl_joints = compute_human_joints(
+            body_pose_63, global_orient_z
+        ).numpy()                                                # (T, 24, 3)
+
+    # === 3. transl: Y-up root_positions (unchanged) ===
+    transl = root_positions.astype(np.float32)                   # (T, 3)
+
+    # === 4. Resample to target_fps ===
     # Use the same duration-based formula as motion_lib's interpolate_pose:
     #   duration = (T - 1) / source_fps
     #   n_target = floor(duration * target_fps) + 1
     # This ensures SMPL frame count matches robot motion after interpolation.
+    # Keep original (pre-resample) pose_aa for backup.
+    original_pose_aa = pose_aa.copy()
+
     if abs(source_fps - target_fps) > 0.5:
         duration = (T - 1) / source_fps
         n_target = int(duration * target_fps) + 1
@@ -109,9 +155,7 @@ def convert_npz_to_smpl_pkl(npz_path: str, target_fps: float = 30.0) -> dict:
         "smpl_joints": smpl_joints.astype(np.float32),
         "transl": transl.astype(np.float32),
         "fps": target_fps,
-        "original_pose_aa": Rotation.from_matrix(
-            local_rot_mats[:, SOMA77_INDICES, :, :].reshape(-1, 3, 3)
-        ).as_rotvec().astype(np.float32).reshape(T, 72),
+        "original_pose_aa": original_pose_aa.astype(np.float32),
         "original_fps": source_fps,
     }
 

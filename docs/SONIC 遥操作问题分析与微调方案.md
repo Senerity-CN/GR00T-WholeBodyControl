@@ -347,6 +347,21 @@ n_target = int(duration * target_fps) + 1
 
 修复后重新生成 144 个 SMPL PKL，帧数全部对齐。
 
+#### SMPL 坐标系与 Base Rotation 不一致（2025-06-13 修复）
+
+**现象**：转换后的 SMPL 数据 pelvis 随全局位移漂移 9m，smpl_joints 为 Y-up（应为 Z-up），且可视化时人体横着。
+
+**根因**：
+1. `smpl_joints` 直接使用了 SOMA 的 `posed_joints`（Y-up world-space，含全局位移），应使用 `compute_human_joints` FK 输出（Z-up，pelvis 固定）
+2. `pose_aa[:,:3]` 错误地乘了 SMPL base rotation（120° around [1,1,1]），但 bones_seed 数据不包含 base rotation
+
+**修复**：
+- `pose_aa[:,:3]` = `R_world.as_rotvec()`（直接存世界朝向，不含 base rotation）
+- `smpl_joints` = `compute_human_joints(body[:63], ytoz(root_aa))`（与 teleop pipeline 和 bones_seed 一致）
+- `transl` 保持 Y-up 不变（transl[1] = 高度）
+
+**验证**：pelvis 固定于 J[0]=(0.003,-0.351,0.012)，head_z=0.47 > foot_z=-0.88（Z-up），root norm~0.08（无 base），Z-range=1.56m（与 bones_seed 1.56m 一致）。
+
 ---
 
 ### 工具链参考
@@ -356,7 +371,7 @@ n_target = int(duration * target_fps) + 1
 | Kimodo 文本生成 | `/home/balance/kimodo/` | 文本 → SOMA 运动 |
 | 生成脚本 v1 | `/home/balance/kimodo/generate_finetune_motions.sh` | 3 类 75 条基础动作 |
 | 生成脚本 v2 | `/home/balance/kimodo/generate_finetune_motions_v2.sh` | 5 类 ~183 条补充动作（含拖椅、递物、组合等） |
-| SOMA→SMPL 转换 | `gear_sonic/data_process/convert_kimodo_soma_to_smpl_lib.py` | Kimodo NPZ → SMPL PKL（已修复帧数对齐） |
+| SOMA→SMPL 转换 | `gear_sonic/data_process/convert_kimodo_soma_to_smpl_lib.py` | Kimodo NPZ → SMPL PKL（已修复帧数对齐 + 坐标系/base rotation） |
 | CSV→motion_lib 转换 | `gear_sonic/data_process/convert_soma_csv_to_motion_lib.py` | G1 CSV → robot motion_lib PKL |
 | 动作过滤 | `gear_sonic/data_process/filter_and_copy_bones_data.py` | 按文件名关键词过滤不可执行动作 |
 | SOMA Retargeter | `/home/balance/soma-retargeter/` | BVH → G1 29-DOF CSV（Newton IK） |
