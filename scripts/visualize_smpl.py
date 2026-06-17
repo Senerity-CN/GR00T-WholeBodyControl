@@ -358,6 +358,7 @@ def main():
     frame_idx = 0
     speed = 1.0
     period = 1.0 / playback_fps
+    next_tick = time.time()
     print(f"[Replay] Playing at {playback_fps} FPS ({n_frames} frames)", flush=True)
 
     try:
@@ -369,6 +370,7 @@ def main():
                 print(HELP_TEXT, flush=True)
             elif ch in ("p", " "):
                 playing = not playing
+                next_tick = time.time()  # reset tick after pause
                 print(f"[Replay] {'PLAY' if playing else 'PAUSED'} frame {frame_idx}/{n_frames}", flush=True)
             elif ch == "." and not playing and frame_idx < n_frames - 1:
                 frame_idx += 1
@@ -376,13 +378,16 @@ def main():
                 frame_idx -= 1
             elif ch == "r":
                 frame_idx = 0
+                next_tick = time.time()
                 visualizer.reset_smpl_anchor()
                 print("[Replay] Restart", flush=True)
             elif ch in ("+", "="):
                 speed = min(speed * 2, 16.0)
+                next_tick = time.time()
                 print(f"[Replay] Speed: {speed:.1f}x", flush=True)
             elif ch == "-":
                 speed = max(speed / 2, 0.125)
+                next_tick = time.time()
                 print(f"[Replay] Speed: {speed:.1f}x", flush=True)
 
             # Update SMPL skeleton
@@ -400,7 +405,13 @@ def main():
                     frame_idx = 0
                     visualizer.reset_smpl_anchor()
 
-            time.sleep(period / speed)
+            # Wall-clock synchronized pacing (compensates for render time)
+            next_tick += period / speed
+            sleep_for = next_tick - time.time()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                next_tick = time.time()
 
     except KeyboardInterrupt:
         pass
