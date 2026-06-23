@@ -246,7 +246,10 @@ class ImEvalCallback(TrainerCallback):
         self.model.eval()
         if hasattr(self.model.policy, "eval_mode"):
             self.model.policy.eval_mode()  # For VAE, eval mode means that we are no longer sampling from the VAE but using the mean latent value.
-        self.env.set_is_evaluating(True, global_rank=self.args.global_rank)
+        start_idx_override = self.env.config.get("eval_start_idx", None)
+        if start_idx_override == 0:
+            start_idx_override = None
+        self.env.set_is_evaluating(True, global_rank=self.args.global_rank, start_idx_override=start_idx_override)
 
     def _train_mode(self):
         if self.eval_only and self.in_eval_mode:
@@ -262,9 +265,15 @@ class ImEvalCallback(TrainerCallback):
         if reset_env:
             _ = self.env.reset_all()
 
+        eval_start_idx = self.env.config.get("eval_start_idx", 0)
+        eval_end_idx = self.env.config.get("eval_end_idx", self.env._motion_lib._num_unique_motions)
+        self._eval_start_idx = eval_start_idx
+        self._eval_end_idx = eval_end_idx
+
+        segment_size = eval_end_idx - eval_start_idx
         self.num_total_env_eval_loops = int(
             np.ceil(
-                self.env._motion_lib._num_unique_motions
+                segment_size
                 / (self.env.num_envs * self.args.world_size)
             )
         )
@@ -425,14 +434,15 @@ class ImEvalCallback(TrainerCallback):
                 .numpy()
             )
 
+            segment_truncate = self._eval_end_idx - self._eval_start_idx
             self.success_rate = (
                 1
                 - np.concatenate(self.terminate_memory)[
-                    : self.env._motion_lib._num_unique_motions
+                    : segment_truncate
                 ].mean()
             )
             self.progress_rate = np.concatenate(self.progress_memory)[
-                : self.env._motion_lib._num_unique_motions
+                : segment_truncate
             ].mean()
 
             # MPJPE
@@ -508,8 +518,9 @@ class ImEvalCallback(TrainerCallback):
 
                 terminate_hist = np.concatenate(self.terminate_memory)
                 progress_hist = np.concatenate(self.progress_memory)
+                segment_size = self._eval_end_idx - self._eval_start_idx
                 succ_idxes = np.nonzero(
-                    ~terminate_hist[: self.env._motion_lib._num_unique_motions]
+                    ~terminate_hist[: segment_size]
                 )[0].tolist()
                 self.accelerator.wait_for_everyone()
                 # metrics_all = compute_metrics_lite(self.pred_pos_all, self.gt_pos_all, self.pred_rot_all, self.gt_rot_all, concatenate = False) # OOM
@@ -671,13 +682,14 @@ class ImEvalCallback(TrainerCallback):
                 all_metrics = torch.cat(gathered_chunks, dim=1)
 
                 metric_size = all_metrics.shape[-1]
+                segment_size = self._eval_end_idx - self._eval_start_idx
                 gathered_metrics_stack = (
                     all_metrics.reshape(
                         self.accelerator.num_processes, -1, self.env.num_envs, metric_size
                     )
                     .transpose(0, 1)
-                    .reshape(-1, metric_size)[: self.env._motion_lib._num_unique_motions]
-                )  # make sure that we are selecting the correct ones.
+                    .reshape(-1, metric_size)[: segment_size]
+                )  # truncate to segment size to remove padding from last batch
 
                 # Extract tail columns: terminate, progress, (obj_pos_err, obj_ori_err,) motion_idx
                 num_tail = 3 + (
@@ -695,7 +707,7 @@ class ImEvalCallback(TrainerCallback):
                     gathered_motion_idxes = gathered_metrics_stack[:, num_body_metrics + 2].long()
                 gathered_progress_hist_stack[~gathered_terminate_hist_stack] = 1
 
-                assert (gathered_motion_idxes.diff(dim=0) == 1).all()
+                assert (gathered_motion_idxes.diff(dim=0) >= 0).all(), f"Motion indices not monotonically increasing: {gathered_motion_idxes[:10]}"
 
                 # Micro-average: sum all frame-level sums, divide by total frames
                 # (each timestep weighted equally, longer motions contribute more)
@@ -738,10 +750,13 @@ class ImEvalCallback(TrainerCallback):
                     metrics_succ_print["obj_pos_error"] = obj_pos_err_succ
                     metrics_succ_print["obj_ori_error"] = obj_ori_err_succ
 
-                failed_keys = self.env._motion_lib._motion_data_keys[
+                all_motion_keys_in_segment = self.env._motion_lib._motion_data_keys[
+                    gathered_motion_idxes.cpu().numpy()
+                ]
+                failed_keys = all_motion_keys_in_segment[
                     gathered_terminate_hist_stack.cpu().numpy()
                 ]
-                success_keys = self.env._motion_lib._motion_data_keys[
+                success_keys = all_motion_keys_in_segment[
                     ~gathered_terminate_hist_stack.cpu().numpy()
                 ]
                 success_rate = 1 - gathered_terminate_hist_stack.cpu().numpy().mean()
@@ -779,8 +794,9 @@ class ImEvalCallback(TrainerCallback):
                     for idx, (k, v) in enumerate(metrics_all_sum.items())
                 }
                 failed_metrics_dict["motion_keys"] = failed_keys
+                failed_motion_idxes = gathered_motion_idxes[gathered_terminate_hist_stack]
                 failed_metrics_dict["sampling_prob"] = (
-                    self.env._motion_lib._sampling_prob[gathered_terminate_hist_stack.cpu().numpy()]
+                    self.env._motion_lib._sampling_prob[failed_motion_idxes.cpu().numpy()]
                     .cpu()
                     .numpy()
                 )

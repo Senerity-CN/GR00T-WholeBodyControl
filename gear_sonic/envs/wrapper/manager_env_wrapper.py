@@ -1003,18 +1003,21 @@ class ManagerEnvWrapper:
             self._hist_idx = 0
             self._blit_background = None
 
-    def set_is_evaluating(self, is_evaluating: bool = True, global_rank=0, **_kwargs):
+    def set_is_evaluating(self, is_evaluating: bool = True, global_rank=0, start_idx_override=None, **_kwargs):
         self.is_evaluating = is_evaluating
         if self.motion_command is not None:
             self.motion_command.set_is_evaluating(is_evaluating)
         if self.force_command is not None:
             self.force_command.set_is_evaluating(is_evaluating)
         if is_evaluating:
-            self.begin_seq_motion_samples(global_rank)
+            self.begin_seq_motion_samples(global_rank, start_idx_override=start_idx_override)
 
-    def begin_seq_motion_samples(self, global_rank=0):
+    def begin_seq_motion_samples(self, global_rank=0, start_idx_override=None):
         logger.info("Loading motions for evaluation")
-        self.start_idx = global_rank * self.num_envs
+        if start_idx_override is not None:
+            self.start_idx = start_idx_override
+        else:
+            self.start_idx = global_rank * self.num_envs
         self._motion_lib.load_motions_for_evaluation(start_idx=self.start_idx)
         self.reset_all(global_rank=global_rank)
 

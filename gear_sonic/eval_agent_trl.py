@@ -370,6 +370,15 @@ def main(override_config: omegaconf.OmegaConf):
 
     env = train_agent_trl.create_manager_env(config, device, args_cli)
 
+    eval_start_idx = config.get("eval_start_idx", 0)
+    eval_end_idx = config.get("eval_end_idx", None)
+    if eval_end_idx is None:
+        eval_end_idx = env._motion_lib._num_unique_motions
+    with omegaconf.open_dict(env.config):
+        env.config["eval_start_idx"] = eval_start_idx
+        env.config["eval_end_idx"] = eval_end_idx
+    logger.info(f"Evaluation segment: [{eval_start_idx}, {eval_end_idx}) = {eval_end_idx - eval_start_idx} motions")
+
     module_dim_dict = getattr(config.algo.config, "module_dim", {})
     policy_backbone_kwargs = {}
     critic_backbone_kwargs = {}
